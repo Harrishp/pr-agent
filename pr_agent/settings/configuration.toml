@@ -9,7 +9,7 @@ fallback_models=["o4-mini"]
 #model_reasoning="o4-mini" # dedicated reasoning model for self-reflection
 #model_weak="gpt-4o" # optional, a weaker model to use for some easier tasks
 # CLI
-git_provider="github"
+git_provider="gitea"
 publish_output=true
 publish_output_progress=true
 verbosity_level=0 # 0,1,2
@@ -271,7 +271,7 @@ push_commands = [
 # ssl_verify = true
 
 [gitea]
-url = "https://gitea.com"
+url = "http://localhost:8005"
 handle_push_trigger = false
 pr_commands = [
     "/describe",
