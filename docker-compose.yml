@@ -1,0 +1,28 @@
+version: "3.8"
+services:
+  pr-agent:
+    image: pr-agent:gitea-1.21.5
+    container_name: pr-agent
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - CONFIG__GIT_PROVIDER=gitea
+      - GITEA__URL=${GITEA_URL}
+      - GITEA__PERSONAL_ACCESS_TOKEN=${GITEA_TOKEN}
+      - GITEA__WEBHOOK_SECRET=${WEBHOOK_SECRET}
+      - GITEA__SKIP_SSL_VERIFICATION=false
+      # AI model (self-hosted OpenAI-compatible endpoint)
+      - OPENAI__KEY=${OPENAI_KEY}
+      - OPENAI__API_BASE=${OPENAI_API_BASE}
+      - CONFIG__MODEL=${MODEL}
+      # Auto review commands
+      - GITEA__PR_COMMANDS=["/describe", "/review", "/improve"]
+      - GITEA__HANDLE_PUSH_TRIGGER=false
+      - GITEA__PUSH_COMMANDS=["/review"]
+    networks:
+      - pr-agent-net
+
+networks:
+  pr-agent-net:
+    driver: bridge

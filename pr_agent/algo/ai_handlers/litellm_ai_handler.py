@@ -1,4 +1,7 @@
+import asyncio
+import json
 import os
+
 import litellm
 import openai
 import requests
@@ -12,7 +15,6 @@ from pr_agent.algo.ai_handlers.litellm_helpers import _handle_streaming_response
 from pr_agent.algo.utils import ReasoningEffort, get_version
 from pr_agent.config_loader import get_settings
 from pr_agent.log import get_logger
-import json
 
 MODEL_RETRIES = 2
 DUMMY_LITELLM_API_KEY = "dummy_key"  # placeholder set when no OpenAI key is configured
@@ -153,8 +155,127 @@ class LiteLLMAIHandler(BaseAiHandler):
         # Models that require streaming
         self.streaming_required_models = STREAMING_REQUIRED_MODELS
 
+    @staticmethod
+    def _get_attr_or_key(obj, key, default=None):
+        if obj is None:
+            return default
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    @staticmethod
+    def _to_bool(value, default=False):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    def _get_openai_api_mode(self) -> str:
+        api_mode = str(get_settings().get("OPENAI.API_MODE", "chat_completions") or "chat_completions").strip().lower()
+        if api_mode not in {"chat_completions", "responses"}:
+            get_logger().warning(
+                f"Invalid OPENAI.API_MODE '{api_mode}'. Falling back to 'chat_completions'."
+            )
+            return "chat_completions"
+        return api_mode
+
+    def _response_to_dict(self, response):
+        if response is None:
+            return {}
+        if isinstance(response, dict):
+            return response.copy()
+
+        serializer = getattr(response, "dict", None)
+        if callable(serializer):
+            try:
+                return serializer()
+            except Exception:
+                pass
+
+        serializer = getattr(response, "model_dump", None)
+        if callable(serializer):
+            try:
+                return serializer()
+            except Exception:
+                pass
+
+        return {"response": str(response)}
+
+    def _extract_message_text(self, content) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                text = self._get_attr_or_key(item, "text")
+                if text:
+                    text_parts.append(text)
+            return "".join(text_parts)
+        return ""
+
+    def _extract_response_content(self, response):
+        response_dict = self._response_to_dict(response)
+
+        output_text = self._get_attr_or_key(response, "output_text") or response_dict.get("output_text")
+        if output_text:
+            finish_reason = self._get_attr_or_key(response, "finish_reason") or response_dict.get("finish_reason")
+            return output_text, finish_reason
+
+        choices = response_dict.get("choices") or self._get_attr_or_key(response, "choices") or []
+        if not isinstance(choices, (list, tuple)):
+            choices = []
+        if choices:
+            first_choice = choices[0]
+            message = self._get_attr_or_key(first_choice, "message", {})
+            content = self._extract_message_text(self._get_attr_or_key(message, "content"))
+            if content:
+                finish_reason = self._get_attr_or_key(first_choice, "finish_reason")
+                return content, finish_reason
+
+        output_items = response_dict.get("output") or self._get_attr_or_key(response, "output") or []
+        if not isinstance(output_items, (list, tuple)):
+            output_items = []
+        text_parts = []
+        finish_reason = None
+        for item in output_items:
+            finish_reason = finish_reason or self._get_attr_or_key(item, "finish_reason") or self._get_attr_or_key(item, "status")
+            for content_item in self._get_attr_or_key(item, "content", []) or []:
+                text = self._get_attr_or_key(content_item, "text")
+                if text:
+                    text_parts.append(text)
+
+        if text_parts:
+            return "\n".join(text_parts).strip(), finish_reason
+
+        raise openai.APIError("Responses API returned no text content")
+
+    def _process_openai_responses_extra_body(self, kwargs: dict) -> dict:
+        extra_body = get_settings().get("OPENAI.RESPONSES_EXTRA_BODY", None)
+        if not extra_body:
+            return kwargs
+
+        try:
+            responses_extra_body = json.loads(extra_body)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"OPENAI.RESPONSES_EXTRA_BODY contains invalid JSON: {str(e)}") from e
+
+        if not isinstance(responses_extra_body, dict):
+            raise ValueError("OPENAI.RESPONSES_EXTRA_BODY must be a JSON object")
+
+        colliding_keys = kwargs.keys() & responses_extra_body.keys()
+        if colliding_keys:
+            raise ValueError(
+                f"OPENAI.RESPONSES_EXTRA_BODY cannot override existing parameters: {', '.join(sorted(colliding_keys))}"
+            )
+
+        kwargs.update(responses_extra_body)
+        return kwargs
+
     def prepare_logs(self, response, system, user, resp, finish_reason):
-        response_log = response.dict().copy()
+        response_log = self._response_to_dict(response)
         response_log['system'] = system
         response_log['user'] = user
         response_log['output'] = resp
@@ -271,6 +392,7 @@ class LiteLLMAIHandler(BaseAiHandler):
         try:
             resp, finish_reason = None, None
             deployment_id = self.deployment_id
+            api_mode = self._get_openai_api_mode()
             if self.azure:
                 model = 'azure/' + model
             if 'claude' in model and not system:
@@ -322,21 +444,21 @@ class LiteLLMAIHandler(BaseAiHandler):
                 system = ""
                 get_logger().info(f"Using model {model}, combining system and user prompts")
                 messages = [{"role": "user", "content": user}]
-                kwargs = {
-                    "model": model,
-                    "deployment_id": deployment_id,
-                    "messages": messages,
-                    "timeout": get_settings().config.ai_timeout,
-                    "api_base": self.api_base,
-                }
             else:
-                kwargs = {
-                    "model": model,
-                    "deployment_id": deployment_id,
-                    "messages": messages,
-                    "timeout": get_settings().config.ai_timeout,
-                    "api_base": self.api_base,
-                }
+                messages = messages
+
+            kwargs = {
+                "model": model,
+                "deployment_id": deployment_id,
+                "timeout": get_settings().config.ai_timeout,
+                "api_base": self.api_base,
+            }
+
+            if api_mode == "responses":
+                kwargs["input"] = messages
+                kwargs["store"] = self._to_bool(get_settings().get("OPENAI.RESPONSES_STORE", False), default=False)
+            else:
+                kwargs["messages"] = messages
 
             # Add temperature only if model supports it
             if model not in self.no_support_temperature_models and not get_settings().config.custom_reasoning_model:
@@ -394,6 +516,8 @@ class LiteLLMAIHandler(BaseAiHandler):
 
             # Support for custom OpenAI body fields (e.g., Flex Processing)
             kwargs = _process_litellm_extra_body(kwargs)
+            if api_mode == "responses":
+                kwargs = self._process_openai_responses_extra_body(kwargs)
 
             # Support for Bedrock custom inference profile via model_id
             model_id = get_settings().get("litellm.model_id")
@@ -413,7 +537,7 @@ class LiteLLMAIHandler(BaseAiHandler):
                 kwargs["api_key"] = litellm.api_key
 
             # Get completion with automatic streaming detection
-            resp, finish_reason, response_obj = await self._get_completion(**kwargs)
+            resp, finish_reason, response_obj = await self._get_completion(api_mode=api_mode, **kwargs)
 
         except openai.RateLimitError as e:
             get_logger().error(f"Rate limit error during LLM inference: {e}")
@@ -437,11 +561,25 @@ class LiteLLMAIHandler(BaseAiHandler):
 
         return resp, finish_reason
 
-    async def _get_completion(self, **kwargs):
+    async def _create_responses_completion(self, **kwargs):
+        if hasattr(litellm, "aresponses") and callable(litellm.aresponses):
+            return await litellm.aresponses(**kwargs)
+
+        if hasattr(litellm, "responses") and callable(litellm.responses):
+            return await asyncio.to_thread(litellm.responses, **kwargs)
+
+        raise openai.APIError("LiteLLM responses API is not available in the installed version")
+
+    async def _get_completion(self, api_mode="chat_completions", **kwargs):
         """
         Wrapper that automatically handles streaming for required models.
         """
         model = kwargs["model"]
+        if api_mode == "responses":
+            response = await self._create_responses_completion(**kwargs)
+            resp, finish_reason = self._extract_response_content(response)
+            return resp, finish_reason or "stop", response
+
         if model in self.streaming_required_models:
             kwargs["stream"] = True
             get_logger().info(f"Using streaming mode for model {model}")

@@ -33,6 +33,24 @@ OPENAI__API_BASE=https://api.openai.com/v1
 OPENAI__KEY=sk-...
 ```
 
+If your provider exposes the newer OpenAI-compatible `/v1/responses` endpoint instead of `/v1/chat/completions`, set:
+
+```toml
+[openai]
+api_base = "https://your-provider.example.com/v1"
+key = "sk-..."
+api_mode = "responses"
+responses_store = false
+responses_extra_body = "{}"
+```
+
+Notes:
+
+- `api_mode = "responses"` switches PR-Agent's LiteLLM handler to call the Responses API instead of Chat Completions.
+- `responses_store = false` is recommended for PR review workloads, to avoid persisting pull request contents on the upstream provider unless you explicitly want that behavior.
+- If your provider requires custom body fields, pass them via `responses_extra_body` as a JSON object string.
+- For custom third-party model names, also set `config.custom_model_max_tokens`, and consider `config.custom_reasoning_model = true` if the provider does not support separate `system` messages or `temperature`.
+
 ### OpenAI Flex Processing
 
 To reduce costs for non-urgent/background tasks, enable Flex Processing:

@@ -35,7 +35,7 @@ def apply_repo_settings(pr_url):
                 category = 'local'
                 try:
                     fd, repo_settings_file = tempfile.mkstemp(suffix='.toml')
-                    os.write(fd, repo_settings)
+                    os.write(fd, repo_settings if isinstance(repo_settings, bytes) else repo_settings.encode())
 
                     try:
                         dynconf_kwargs = {'core_loaders': [],  # DISABLE default loaders, otherwise will load toml files more than once.
@@ -97,7 +97,7 @@ def handle_configurations_errors(config_errors, git_provider):
 
         for err in config_errors:
             if err:
-                configuration_file_content = err['settings'].decode()
+                configuration_file_content = err['settings'].decode() if isinstance(err['settings'], bytes) else err['settings']
                 err_message = err['error']
                 config_type = err['category']
                 header = f"❌ **PR-Agent failed to apply '{config_type}' repo settings**"
