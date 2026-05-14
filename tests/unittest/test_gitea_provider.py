@@ -1,6 +1,8 @@
 from io import BytesIO
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 
 class TestGiteaProvider:
     @patch('pr_agent.git_providers.gitea_provider.get_settings')
@@ -103,3 +105,40 @@ class TestGiteaProvider:
         args, kwargs = mock_api_client.call_api.call_args
         assert args[0] == '/repos/owner/repo/pulls/123/commits'
         assert kwargs.get('auth_settings') == ['AuthorizationHeaderToken']
+
+    @pytest.fixture
+    def repo_api(self):
+        from pr_agent.git_providers.gitea_provider import RepoApi
+
+        client = MagicMock()
+        return RepoApi(client)
+
+    def test_get_pull_request_diff_decodes_gbk_content(self, repo_api):
+        content = "diff --git a/demo.java b/demo.java\n@@ -1 +1 @@\n-// 中文注释\n+// 中文注释已修改"
+        mock_resp = MagicMock()
+        mock_resp.data = BytesIO(content.encode("gbk"))
+        repo_api.api_client.call_api.return_value = mock_resp
+
+        result = repo_api.get_pull_request_diff("owner", "repo", 123)
+
+        assert result == content
+
+    def test_get_file_content_decodes_gbk_content(self, repo_api):
+        content = "public class Demo {\n    // 中文注释：GBK编码\n}"
+        mock_resp = MagicMock()
+        mock_resp.data = BytesIO(content.encode("gbk"))
+        repo_api.api_client.call_api.return_value = mock_resp
+
+        result = repo_api.get_file_content("owner", "repo", "sha1", "Demo.java")
+
+        assert result == content
+
+    def test_get_change_file_pull_request_keeps_utf8_json_decoding(self, repo_api):
+        content = '[{"filename": "中文.java"}]'
+        mock_resp = MagicMock()
+        mock_resp.data = BytesIO(content.encode("utf-8"))
+        repo_api.api_client.call_api.return_value = mock_resp
+
+        result = repo_api.get_change_file_pull_request("owner", "repo", 123)
+
+        assert result == [{"filename": "中文.java"}]

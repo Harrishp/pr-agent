@@ -6,6 +6,7 @@ import giteapy
 from giteapy.rest import ApiException
 
 from pr_agent.algo.file_filter import filter_ignored
+from pr_agent.algo.git_patch_processing import decode_if_bytes
 from pr_agent.algo.language_handler import is_valid_file
 from pr_agent.algo.types import EDIT_TYPE
 from pr_agent.algo.utils import (clip_tokens,
@@ -813,10 +814,10 @@ class RepoApi(giteapy.RepositoryApi):
 
             if hasattr(response, 'data'):
                 raw_data = response.data.read()
-                return raw_data.decode('utf-8')
+                return decode_if_bytes(raw_data)
             elif isinstance(response, tuple):
                 raw_data = response[0].read()
-                return raw_data.decode('utf-8')
+                return decode_if_bytes(raw_data)
             else:
                 error_msg = f"Unexpected response format received from API: {type(response)}"
                 self.logger.error(error_msg)
@@ -936,10 +937,10 @@ class RepoApi(giteapy.RepositoryApi):
 
             if hasattr(response, 'data'):
                 raw_data = response.data.read()
-                return raw_data.decode('utf-8')
+                return decode_if_bytes(raw_data)
             elif isinstance(response, tuple):
                 raw_data = response[0].read()
-                return raw_data.decode('utf-8')
+                return decode_if_bytes(raw_data)
 
             return ""
 
