@@ -2,6 +2,8 @@
 .lsp/
 .vscode/
 .env
+.env.local
+.env.*.local
 .venv/
 venv/
 pr_agent/settings/.secrets.toml

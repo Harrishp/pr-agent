@@ -1,4 +1,3 @@
-version: "3.8"
 services:
   pr-agent:
     image: pr-agent:gitea-1.21.5
@@ -6,20 +5,28 @@ services:
     restart: unless-stopped
     ports:
       - "3000:3000"
+    env_file:
+      - ./.env
     environment:
-      - CONFIG__GIT_PROVIDER=gitea
+      - CONFIG__GIT_PROVIDER=${GIT_PROVIDER}
       - GITEA__URL=${GITEA_URL}
       - GITEA__PERSONAL_ACCESS_TOKEN=${GITEA_TOKEN}
       - GITEA__WEBHOOK_SECRET=${WEBHOOK_SECRET}
-      - GITEA__SKIP_SSL_VERIFICATION=false
+      - GITEA__SKIP_SSL_VERIFICATION=${SKIP_SSL_VERIFICATION}
       # AI model (self-hosted OpenAI-compatible endpoint)
       - OPENAI__KEY=${OPENAI_KEY}
       - OPENAI__API_BASE=${OPENAI_API_BASE}
       - CONFIG__MODEL=${MODEL}
+      - CONFIG__CUSTOM_MODEL_MAX_TOKENS=${CUSTOM_MODEL_MAX_TOKENS}
+      - CONFIG__FALLBACK_MODELS=${FALLBACK_MODELS}
+      - CONFIG__RESPONSE_LANGUAGE=${RESPONSE_LANGUAGE}
+      - CONFIG__USE_REPO_SETTINGS_FILE=false
+      - CONFIG__USE_WIKI_SETTINGS_FILE=false
       # Auto review commands
-      - GITEA__PR_COMMANDS=["/describe", "/review", "/improve"]
-      - GITEA__HANDLE_PUSH_TRIGGER=false
-      - GITEA__PUSH_COMMANDS=["/review"]
+      - GITEA__PR_COMMANDS=${PR_COMMANDS}
+      - GITEA__HANDLE_PUSH_TRIGGER=${HANDLE_PUSH_TRIGGER}
+      - GITEA__PUSH_COMMANDS=${PUSH_COMMANDS}
+      - GUNICORN_CMD_ARGS=--timeout 600 --graceful-timeout 600
     networks:
       - pr-agent-net
 
