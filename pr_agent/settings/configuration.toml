@@ -32,6 +32,7 @@ max_model_tokens = 32000 # Limits the maximum number of tokens that can be used 
 custom_model_max_tokens=-1 # for models not in the default list
 model_token_count_estimate_factor=0.3 # factor to increase the token count estimate, in order to reduce likelihood of model failure due to too many tokens - applicable only when requesting an accurate estimate.
 # patch extension logic
+fallback_encodings = ["utf-8", "gb18030", "gbk", "gb2312", "utf-16", "latin-1"]
 patch_extension_skip_types =[".md",".txt"]
 allow_dynamic_context=true
 max_extra_lines_before_dynamic_context = 10 # will try to include up to 10 extra lines before the hunk in the patch, until we reach an enclosing function or class

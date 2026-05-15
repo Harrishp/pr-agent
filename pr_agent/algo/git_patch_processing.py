@@ -36,18 +36,22 @@ def extend_patch(original_file_str, patch_str, patch_extra_lines_before=0,
     return extended_patch_str
 
 
+DEFAULT_FALLBACK_ENCODINGS = ["utf-8", "gb18030", "gbk", "gb2312", "utf-16", "latin-1"]
+
+
+def get_fallback_encodings():
+    return get_settings().get("config.fallback_encodings", DEFAULT_FALLBACK_ENCODINGS)
+
+
 def decode_if_bytes(original_file_str):
     if isinstance(original_file_str, (bytes, bytearray)):
-        try:
-            return original_file_str.decode('utf-8')
-        except UnicodeDecodeError:
-            encodings_to_try = ['iso-8859-1', 'latin-1', 'ascii', 'utf-16']
-            for encoding in encodings_to_try:
-                try:
-                    return original_file_str.decode(encoding)
-                except UnicodeDecodeError:
-                    continue
-            return ""
+        for encoding in get_fallback_encodings():
+            try:
+                return original_file_str.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+        get_logger().warning("Failed to decode bytes with configured fallback encodings")
+        return ""
     return original_file_str
 
 
