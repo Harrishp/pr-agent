@@ -129,7 +129,8 @@ def convert_to_markdown_v2(output_data: dict,
                            gfm_supported: bool = True,
                            incremental_review=None,
                            git_provider=None,
-                           files=None) -> str:
+                           files=None,
+                           markdown_flavor: str | None = None) -> str:
     """
     Convert a dictionary of data into markdown format.
     Args:
@@ -162,6 +163,8 @@ def convert_to_markdown_v2(output_data: dict,
         markdown_text += f"⏮️ Review for commits since previous PR-Agent review {incremental_review}.\n\n"
     if not output_data or not output_data.get('review', {}):
         return ""
+    if markdown_flavor == "gitea":
+        return _convert_review_to_gitea_markdown(output_data, incremental_review, git_provider, files)
 
     if get_settings().get("pr_reviewer.enable_intro_text", False):
         markdown_text += f"Here are some key observations to aid the review process:\n\n"
@@ -323,6 +326,149 @@ def convert_to_markdown_v2(output_data: dict,
         markdown_text += "</table>\n"
 
     return markdown_text
+
+
+def _convert_review_to_gitea_markdown(output_data: dict,
+                                      incremental_review=None,
+                                      git_provider=None,
+                                      files=None) -> str:
+    markdown_text = ""
+    if not incremental_review:
+        markdown_text += f"{PRReviewHeader.REGULAR.value} 🔍\n\n"
+    else:
+        markdown_text += f"{PRReviewHeader.INCREMENTAL.value} 🔍\n\n"
+        markdown_text += f"⏮️ Review for commits since previous PR-Agent review {incremental_review}.\n\n"
+
+    commit_sha = _get_gitea_latest_commit_sha(git_provider)
+    if commit_sha:
+        markdown_text += f"#### Review updated until commit `{commit_sha[:10]}`\n\n"
+
+    if get_settings().get("pr_reviewer.enable_intro_text", False):
+        markdown_text += f"Here are some key observations to aid the review process:\n\n"
+
+    rows = []
+    review_data = output_data['review']
+    review_data.pop('todo_summary', '')
+    for key, value in review_data.items():
+        if value is None or value == '' or value == {} or value == []:
+            if key.lower() not in ['can_be_split', 'key_issues_to_review']:
+                continue
+        key_nice = key.replace('_', ' ').capitalize()
+        if 'Estimated effort to review' in key_nice:
+            effort = _format_gitea_effort(value)
+            if effort:
+                rows.append(("⏱️ **Review 难度**", effort))
+        elif 'relevant tests' in key_nice.lower():
+            rows.append(("🧪 **包含测试**", "❌ 否" if is_value_no(str(value).strip().lower()) else "✅ 是"))
+        elif 'security concerns' in key_nice.lower():
+            rows.append(("🔒 **安全问题**", _format_gitea_security_concerns(value)))
+        elif 'key issues to review' in key_nice.lower():
+            rows.append(("⚡ **重点关注区域**", _format_gitea_key_issues(value, git_provider, files)))
+        else:
+            rows.append((f"**{key_nice}**", _format_gitea_cell_value(value)))
+
+    if not rows:
+        return markdown_text
+
+    markdown_text += "| 项目 | 详情 |\n"
+    markdown_text += "|------|------|\n"
+    for label, value in rows:
+        markdown_text += _format_gitea_table_row(label, value)
+    return markdown_text
+
+
+def _get_gitea_latest_commit_sha(git_provider) -> str:
+    try:
+        if not git_provider:
+            return ""
+        if hasattr(git_provider, "_get_commit_sha") and hasattr(git_provider, "last_commit"):
+            commit_sha = git_provider._get_commit_sha(git_provider.last_commit)
+            return commit_sha if isinstance(commit_sha, str) else ""
+        last_commit = getattr(git_provider, "last_commit", None)
+        if last_commit:
+            if isinstance(last_commit, dict):
+                commit_sha = last_commit.get("sha", last_commit.get("id", ""))
+            else:
+                commit_sha = getattr(last_commit, "sha", getattr(last_commit, "id", ""))
+            return commit_sha if isinstance(commit_sha, str) else ""
+        commit_sha = getattr(git_provider, "sha", "")
+        return commit_sha if isinstance(commit_sha, str) else ""
+    except Exception as e:
+        get_logger().exception(f"Failed to get Gitea latest commit sha: {e}")
+        return ""
+
+
+def _format_gitea_table_row(label: str, value: str) -> str:
+    return f"| {label} | {_format_gitea_cell_value(value)} |\n"
+
+
+def _format_gitea_cell_value(value) -> str:
+    if isinstance(value, list):
+        return "<br>".join(_format_gitea_cell_value(item) for item in value)
+    if isinstance(value, dict):
+        return "<br>".join(f"**{key.replace('_', ' ').capitalize()}**: {_format_gitea_cell_value(sub_value)}"
+                            for key, sub_value in value.items())
+    value = str(value).strip()
+    value = value.replace("\r\n", "\n").replace("\r", "\n")
+    value = value.replace("\n", "<br>")
+    return value.replace("|", "\\|")
+
+
+def _format_gitea_effort(value) -> str:
+    value = str(value).strip()
+    if value.isnumeric():
+        value_int = int(value)
+    else:
+        try:
+            value_int = int(value.split(',')[0])
+        except ValueError:
+            return ""
+    value_int = max(0, min(value_int, 5))
+    blue_bars = '🔵' * value_int
+    black_bars = '⚫' * (5 - value_int)
+    return f"{value_int} / 5 　{blue_bars}{black_bars}"
+
+
+def _format_gitea_security_concerns(value) -> str:
+    if is_value_no(value):
+        return "✅ 未发现明显安全问题"
+    value = emphasize_header(str(value).strip(), only_markdown=True)
+    return f"⚠️ {value}"
+
+
+def _format_gitea_key_issues(value, git_provider=None, files=None) -> str:
+    if is_value_no(value):
+        return "✅ 未发现主要问题"
+    if not isinstance(value, list):
+        return _format_gitea_cell_value(value)
+
+    issue_parts = []
+    for issue in value:
+        try:
+            if not issue or not isinstance(issue, dict):
+                continue
+            relevant_file = issue.get('relevant_file', '').strip()
+            issue_header = issue.get('issue_header', '').strip()
+            if issue_header.lower() == 'possible bug':
+                issue_header = 'Possible Issue'
+            issue_content = issue.get('issue_content', '').strip()
+            start_line = int(str(issue.get('start_line', 0)).strip())
+            end_line = int(str(issue.get('end_line', 0)).strip())
+
+            reference_link = git_provider.get_line_link(relevant_file, start_line, end_line) if git_provider else None
+            if reference_link:
+                issue_text = f"[**{issue_header}**]({reference_link})"
+            else:
+                issue_text = f"**{issue_header}**"
+            if relevant_file and start_line:
+                issue_text += f" · `{relevant_file}#L{start_line}`"
+            if issue_content:
+                issue_text += f"<br><br>{_format_gitea_cell_value(issue_content)}"
+            issue_parts.append(issue_text)
+        except Exception as e:
+            get_logger().exception(f"Failed to process Gitea focus area: {e}")
+
+    return "<br><br>".join(issue_parts) if issue_parts else "✅ 未发现主要问题"
 
 
 def extract_relevant_lines_str(end_line, files, relevant_file, start_line, dedent=False) -> str:
