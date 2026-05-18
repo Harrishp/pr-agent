@@ -1,6 +1,6 @@
 services:
   pr-agent:
-    image: pr-agent:gitea-1.21.5
+    image: tdx/gitea-pr-agent:1.0.0
     container_name: pr-agent
     restart: unless-stopped
     ports:
