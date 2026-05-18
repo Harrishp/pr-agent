@@ -274,6 +274,11 @@ push_commands = [
 [gitea]
 url = "http://localhost:8005"
 handle_push_trigger = false
+handle_pr_actions = ["opened", "reopened", "ready_for_review", "review_requested"]
+push_trigger_pending_tasks_ttl = 120
+push_trigger_pending_tasks_backlog = false
+push_trigger_ignore_merge_commits = false
+repo_setting = ".pr_agent.toml"
 pr_commands = [
     "/describe",
     "/review",

@@ -9,7 +9,7 @@ from pr_agent.algo.file_filter import filter_ignored
 from pr_agent.algo.git_patch_processing import decode_if_bytes
 from pr_agent.algo.language_handler import is_valid_file
 from pr_agent.algo.types import EDIT_TYPE
-from pr_agent.algo.utils import (clip_tokens,
+from pr_agent.algo.utils import (PRReviewHeader, clip_tokens,
                                  find_line_number_of_relevant_line_in_file)
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.git_provider import (MAX_FILES_ALLOWED_FULL,
@@ -36,7 +36,7 @@ class GiteaProvider(GitProvider):
             self.logger.error("Gitea access token not found in settings.")
             raise ValueError("Gitea access token not found in settings.")
 
-        self.repo_settings = get_settings().get("GITEA.REPO_SETTING", None)
+        self.repo_settings = get_settings().get("GITEA.REPO_SETTING", get_settings().get("gitea.repo_setting", ".pr_agent.toml"))
         configuration = giteapy.Configuration()
         configuration.host = "{}/api/v1".format(self.base_url)
         configuration.api_key['Authorization'] = f'token {self.gitea_access_token}'
@@ -87,11 +87,12 @@ class GiteaProvider(GitProvider):
             self.sha = self.pr.head.sha if self.pr.head.sha else ""
             self.__add_file_content()
             self.__add_file_diff()
-            self.pr_commits = self.repo_api.list_all_commits(
+            self.pr_commits = self.repo_api.get_pr_commits(
                 owner=self.owner,
-                repo=self.repo
+                repo=self.repo,
+                pr_number=self.pr_number
             )
-            self.last_commit = self.pr_commits[-1]
+            self.last_commit = self.pr_commits[-1] if self.pr_commits else None
             self.last_commit_id = self.last_commit
             self.base_sha = self.pr.base.sha if self.pr.base.sha else ""
             self.base_ref = self.pr.base.ref if self.pr.base.ref else ""
@@ -101,6 +102,27 @@ class GiteaProvider(GitProvider):
             self.enabled_issue = True
         else:
             self.pr_commits = None
+
+    def _get_attr(self, obj, attr: str, default=None):
+        if isinstance(obj, dict):
+            return obj.get(attr, default)
+        return getattr(obj, attr, default)
+
+    def _get_commit_sha(self, commit) -> str:
+        if not commit:
+            return ""
+        return self._get_attr(commit, "sha", self._get_attr(commit, "id", ""))
+
+    def _get_commit_message(self, commit) -> str:
+        commit_data = self._get_attr(commit, "commit", {})
+        if isinstance(commit_data, dict):
+            return commit_data.get("message", "")
+        return self._get_attr(commit_data, "message", "")
+
+    def _get_commit_datetime(self, commit):
+        commit_data = self._get_attr(commit, "commit", {})
+        author = commit_data.get("author", {}) if isinstance(commit_data, dict) else self._get_attr(commit_data, "author", {})
+        return author.get("date") if isinstance(author, dict) else self._get_attr(author, "date", None)
 
     def __add_file_content(self):
         for file in self.git_files:
@@ -225,10 +247,12 @@ class GiteaProvider(GitProvider):
         return self.issue_url
 
     def get_latest_commit_url(self) -> str:
-        return self.last_commit.html_url
+        return self._get_attr(self.last_commit, "html_url", "")
 
     def get_comment_url(self, comment) -> str:
-        return comment.html_url
+        if isinstance(comment, dict):
+            return comment.get("html_url") or comment.get("url", "")
+        return getattr(comment, "html_url", getattr(comment, "url", ""))
 
     def publish_persistent_comment(self, pr_comment: str,
                                    initial_header: str,
@@ -291,6 +315,100 @@ class GiteaProvider(GitProvider):
             self.logger.error(f"Unexpected error: {e}")
             return None
 
+    def edit_comment_from_comment_id(self, comment_id: int, body: str):
+        body = self.limit_output_characters(body, self.max_comment_chars)
+        try:
+            return self.repo_api.edit_comment(
+                owner=self.owner,
+                repo=self.repo,
+                comment_id=comment_id,
+                comment=body
+            )
+        except Exception as e:
+            self.logger.error(f"Failed to edit comment, error: {e}")
+            return None
+
+    def get_comment_body_from_comment_id(self, comment_id: int):
+        try:
+            comment = self.repo_api.get_comment(
+                owner=self.owner,
+                repo=self.repo,
+                comment_id=comment_id
+            )
+            body = self._get_attr(comment, "body", "")
+            if body:
+                return body
+        except Exception as e:
+            self.logger.error(f"Failed to get comment body, error: {e}")
+
+        review_comment = self.get_pull_review_comment(comment_id)
+        if review_comment:
+            return review_comment.get("body", "")
+        return None
+
+    def reply_to_comment_from_comment_id(self, comment_id: int, body: str):
+        body = self.limit_output_characters(body, self.max_comment_chars)
+        try:
+            parent_body = self.get_comment_body_from_comment_id(comment_id) or ""
+            quoted_parent = "\n".join(f"> {line}" for line in parent_body.splitlines())
+            reply_body = f"{quoted_parent}\n\n{body}" if quoted_parent else body
+            return self.publish_comment(reply_body)
+        except Exception as e:
+            self.logger.error(f"Failed to reply comment, error: {e}")
+            return None
+
+    def get_pull_review_comment(self, comment_id: int) -> Optional[Dict[str, Any]]:
+        if not self.enabled_pr:
+            return None
+        try:
+            reviews = self.repo_api.list_pull_reviews(self.owner, self.repo, self.pr_number) or []
+            for review in reviews:
+                review_id = self._get_attr(review, "id")
+                if not review_id:
+                    continue
+                comments = self.repo_api.list_pull_review_comments(self.owner, self.repo, self.pr_number, review_id) or []
+                for comment in comments:
+                    if self._get_attr(comment, "id") != comment_id:
+                        continue
+                    line = (
+                        self._get_attr(comment, "line")
+                        or self._get_attr(comment, "new_line")
+                        or self._get_attr(comment, "original_position")
+                        or self._get_attr(comment, "position")
+                    )
+                    line_comment = {
+                        "id": self._get_attr(comment, "id"),
+                        "body": self._get_attr(comment, "body", ""),
+                        "path": self._get_attr(comment, "path", ""),
+                        "diff_hunk": self._get_attr(comment, "diff_hunk", ""),
+                        "line": line,
+                        "start_line": line,
+                        "side": self._get_attr(comment, "side", "RIGHT") or "RIGHT",
+                        "commit_id": self._get_attr(comment, "commit_id", ""),
+                        "original_position": self._get_attr(comment, "original_position"),
+                        "position": self._get_attr(comment, "position"),
+                        "pull_request_review_id": self._get_attr(comment, "pull_request_review_id", review_id),
+                    }
+                    self.logger.info(
+                        f"Found Gitea review line comment id={comment_id}, path={line_comment['path']}, line={line}"
+                    )
+                    return line_comment
+            self.logger.info(f"Gitea review line comment id={comment_id} not found")
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to get Gitea review line comment id={comment_id}, error: {e}")
+            return None
+
+    def get_review_thread_comments(self, comment_id: int) -> list[dict]:
+        try:
+            review_comment = self.get_pull_review_comment(comment_id)
+            if review_comment:
+                return [review_comment]
+            comments = self.get_issue_comments()
+            return [comment for comment in comments if self._get_attr(comment, "id") == comment_id]
+        except Exception as e:
+            self.logger.error(f"Failed to get review comments for an inline ask command, error: {e}")
+            return []
 
     def publish_inline_comment(self,body: str, relevant_file: str, relevant_line_in_file: str, original_suggestion=None):
         """Publish an inline comment on a specific line"""
@@ -310,40 +428,54 @@ class GiteaProvider(GitProvider):
         self.publish_inline_comments([payload])
 
 
-    def publish_inline_comments(self, comments: List[Dict[str, Any]],body : str = "Inline comment") -> None:
+    def publish_inline_comments(self, comments: List[Dict[str, Any]], body: str = "Inline comment") -> bool:
+        if not comments:
+            self.logger.error("No inline comments provided")
+            return False
+        if not self.enabled_pr:
+            self.logger.error("Inline comments require PR context")
+            return False
+        commit_id = self._get_commit_sha(self.last_commit)
+        if not commit_id:
+            self.logger.error("Cannot publish inline comments without a latest commit")
+            return False
         response = self.repo_api.create_inline_comment(
             owner=self.owner,
             repo=self.repo,
-            pr_number=self.pr_number if self.enabled_pr else self.issue_number,
+            pr_number=self.pr_number,
             body=body,
-            commit_id=self.last_commit.sha if self.last_commit else "",
+            commit_id=commit_id,
             comments=comments
         )
 
         if not response:
             self.logger.error("Failed to publish inline comment")
-            return
+            return False
 
         self.logger.info("Inline comment published")
+        return True
 
-    def publish_code_suggestions(self, suggestions: List[Dict[str, Any]]):
+    def publish_code_suggestions(self, suggestions: List[Dict[str, Any]]) -> bool:
         """Publish code suggestions"""
+        success = True
         for suggestion in suggestions:
-            body = suggestion.get("body","")
+            body = suggestion.get("body", "")
             if not body:
                 self.logger.error("No body provided for the suggestion")
+                success = False
                 continue
 
-            path = suggestion.get("relevant_file","")
-            new_position = suggestion.get("relevant_lines_start",0)
-            old_position = suggestion.get("relevant_lines_start",0) if "original_suggestion" not in suggestion else suggestion["original_suggestion"].get("relevant_lines_start",0)
-            title_body = suggestion["original_suggestion"].get("suggestion_content","") if "original_suggestion" in suggestion else ""
-            payload = dict(body=body, path=path, old_position=old_position,new_position = new_position)
+            path = suggestion.get("relevant_file", "")
+            new_position = suggestion.get("relevant_lines_start", 0)
+            old_position = suggestion.get("relevant_lines_start", 0) if "original_suggestion" not in suggestion else suggestion["original_suggestion"].get("relevant_lines_start", 0)
+            title_body = suggestion["original_suggestion"].get("suggestion_content", "") if "original_suggestion" in suggestion else ""
+            payload = dict(body=body, path=path, old_position=old_position, new_position=new_position)
             if title_body:
                 title_body = f"**Suggestion:** {title_body}"
-                self.publish_inline_comments([payload],title_body)
+                success = self.publish_inline_comments([payload], title_body) and success
             else:
-                self.publish_inline_comments([payload])
+                success = self.publish_inline_comments([payload]) and success
+        return success
 
     def add_eyes_reaction(self, issue_comment_id: int, disable_eyes: bool = False) -> Optional[int]:
         """Add eyes reaction to a comment"""
@@ -382,20 +514,60 @@ class GiteaProvider(GitProvider):
             self.logger.error(f"Unexpected error: {e}")
             return None
 
-    def remove_reaction(self, comment_id: int) -> None:
+    def remove_reaction(self, issue_comment_id: int, reaction_id: int | None = None) -> bool:
         """Remove reaction from a comment"""
         try:
             response = self.repo_api.remove_reaction_comment(
                 owner=self.owner,
                 repo=self.repo,
-                comment_id=comment_id
+                comment_id=issue_comment_id,
+                reaction_id=reaction_id
             )
             if not response:
                 self.logger.error("Failed to remove reaction")
+                return False
+            return True
         except ApiException as e:
             self.logger.error(f"Error removing reaction: {e}")
+            return False
         except Exception as e:
             self.logger.error(f"Unexpected error: {e}")
+            return False
+
+    def get_incremental_commits(self, incremental=IncrementalPR(False)):
+        self.incremental = incremental
+        if not self.incremental.is_incremental:
+            return
+        previous_review = self.get_previous_review(full=True, incremental=True)
+        if not previous_review:
+            self.logger.info("No previous review found, will review the entire PR")
+            self.incremental.is_incremental = False
+            return
+        previous_review_created_at = self._get_attr(previous_review, "created_at", None)
+        self.unreviewed_files_set = {}
+        for commit in self.pr_commits or []:
+            commit_date = self._get_commit_datetime(commit)
+            if previous_review_created_at and commit_date and commit_date <= previous_review_created_at:
+                self.incremental.last_seen_commit = commit
+                continue
+            self.incremental.first_new_commit = self.incremental.first_new_commit or commit
+            for file in self.repo_api.get_commit_files(self.owner, self.repo, self._get_commit_sha(commit)):
+                filename = file.get("filename") if isinstance(file, dict) else self._get_attr(file, "filename", "")
+                if filename:
+                    self.unreviewed_files_set[filename] = file
+
+    def get_previous_review(self, *, full: bool, incremental: bool):
+        if not (full or incremental):
+            raise ValueError("At least one of full or incremental must be True")
+        prefixes = []
+        if full:
+            prefixes.append(PRReviewHeader.REGULAR.value)
+        if incremental:
+            prefixes.append(PRReviewHeader.INCREMENTAL.value)
+        for comment in reversed(list(self.get_issue_comments())):
+            body = self._get_attr(comment, "body", "")
+            if any(body.startswith(prefix) for prefix in prefixes):
+                return comment
 
     def get_commit_messages(self)-> str:
         """Get commit messages for the PR"""
@@ -411,7 +583,8 @@ class GiteaProvider(GitProvider):
             return ""
 
         try:
-            commit_messages = [commit["commit"]["message"] for commit in pr_commits if commit]
+            commit_messages = [self._get_commit_message(commit) for commit in pr_commits if commit]
+            commit_messages = [message for message in commit_messages if message]
 
             if not commit_messages:
                 self.logger.error("No commit messages found")
@@ -455,6 +628,9 @@ class GiteaProvider(GitProvider):
             if not filename:
                 continue
 
+            if self.incremental.is_incremental and self.unreviewed_files_set and filename not in self.unreviewed_files_set:
+                continue
+
             if not is_valid_file(filename):
                 invalid_files_names.append(filename)
                 continue
@@ -477,7 +653,13 @@ class GiteaProvider(GitProvider):
                 head_file = self.file_contents.get(filename,"")
 
             if self.incremental.is_incremental and self.unreviewed_files_set:
-                base_file = self._get_file_content_from_latest_commit(filename)
+                base_sha = self.incremental.last_seen_commit_sha or self.base_sha
+                base_file = self.repo_api.get_file_content(
+                    owner=self.owner,
+                    repo=self.repo,
+                    commit_sha=base_sha,
+                    filepath=filename
+                )
                 self.unreviewed_files_set[filename] = patch
             else:
                 if avoid_load:
@@ -606,17 +788,18 @@ class GiteaProvider(GitProvider):
 
         return [label.name for label in labels]
 
+    def get_repo_labels(self):
+        return self.repo_api.get_repo_labels(owner=self.owner, repo=self.repo)
+
     def get_repo_settings(self) -> str:
         """Get repository settings"""
-        if not self.repo_settings:
-            self.logger.error("Repository settings not found")
-            return ""
-
+        repo_settings_path = self.repo_settings or ".pr_agent.toml"
+        ref = self.base_ref or self.sha
         response = self.repo_api.get_file_content(
             owner=self.owner,
             repo=self.repo,
-            commit_sha=self.sha,
-            filepath=self.repo_settings
+            commit_sha=ref,
+            filepath=repo_settings_path
         )
         if not response:
             self.logger.error("Failed to get repository settings")
@@ -633,7 +816,36 @@ class GiteaProvider(GitProvider):
         return True
 
     def get_git_repo_url(self, issues_or_pr_url: str) -> str:
-        return f"{self.base_url}/{self.owner}/{self.repo}.git" #base_url / <OWNER>/<REPO>.git
+        owner = self.owner
+        repo = self.repo
+        if issues_or_pr_url:
+            try:
+                if "pulls" in issues_or_pr_url:
+                    owner, repo, _ = self._parse_pr_url(issues_or_pr_url)
+                elif "issues" in issues_or_pr_url:
+                    owner, repo, _ = self._parse_issue_url(issues_or_pr_url)
+            except Exception as e:
+                self.logger.error(f"Unable to parse url: {issues_or_pr_url}, error: {e}")
+                return ""
+        return f"{self.base_url}/{owner}/{repo}.git" if owner and repo else ""
+
+    def get_canonical_url_parts(self, repo_git_url: str, desired_branch: str) -> Tuple[str, str]:
+        owner = self.owner
+        repo = self.repo
+        if repo_git_url:
+            parsed_url = urlparse(repo_git_url)
+            repo_path = parsed_url.path.strip('/')
+            if repo_path.endswith('.git'):
+                repo_path = repo_path[:-4]
+            path_parts = repo_path.split('/')
+            if len(path_parts) >= 2:
+                owner, repo = path_parts[-2], path_parts[-1]
+        if not owner or not repo:
+            self.logger.error("Unable to get canonical url parts since missing repository context")
+            return "", ""
+        branch = desired_branch or self.get_pr_branch()
+        prefix = f"{self.base_url}/{owner}/{repo}/src/branch/{branch}"
+        return prefix, ""
 
     def publish_description(self, pr_title: str, pr_body: str) -> None:
         """Publish PR description"""
@@ -672,6 +884,27 @@ class GiteaProvider(GitProvider):
 
         if response:
             self.logger.info("Labels added successfully")
+
+    def auto_approve(self) -> bool:
+        if not self.enabled_pr:
+            return False
+        try:
+            response = self.repo_api.create_review(
+                owner=self.owner,
+                repo=self.repo,
+                pr_number=self.pr_number,
+                body="",
+                commit_id=self._get_commit_sha(self.last_commit),
+                event="APPROVE",
+                comments=[]
+            )
+            return bool(response)
+        except Exception as e:
+            self.logger.error(f"Failed to auto-approve, error: {e}")
+            return False
+
+    def calc_pr_statistics(self, pull_request_data: dict):
+        return {}
 
     def remove_comment(self, comment) -> None:
         """Remove a specific comment"""
@@ -746,20 +979,60 @@ class RepoApi(giteapy.RepositoryApi):
         self.logger = get_logger()
         super().__init__(client)
 
-    def create_inline_comment(self, owner: str, repo: str, pr_number: int, body : str ,commit_id : str, comments: List[Dict[str, Any]]):
-        body = {
+    def create_inline_comment(self, owner: str, repo: str, pr_number: int, body: str, commit_id: str, comments: List[Dict[str, Any]]):
+        return self.create_review(owner, repo, pr_number, body, commit_id, "COMMENT", comments)
+
+    def create_review(self, owner: str, repo: str, pr_number: int, body: str, commit_id: str,
+                      event: str, comments: List[Dict[str, Any]]):
+        review_body = {
             "body": body,
             "comments": comments,
             "commit_id": commit_id,
+            "event": event,
         }
         return self.api_client.call_api(
             '/repos/{owner}/{repo}/pulls/{pr_number}/reviews',
             'POST',
             path_params={'owner': owner, 'repo': repo, 'pr_number': pr_number},
-            body=body,
+            body=review_body,
             response_type='Repository',
             auth_settings=['AuthorizationHeaderToken']
         )
+
+    def list_pull_reviews(self, owner: str, repo: str, pr_number: int):
+        response = self.api_client.call_api(
+            '/repos/{owner}/{repo}/pulls/{pr_number}/reviews',
+            'GET',
+            path_params={'owner': owner, 'repo': repo, 'pr_number': pr_number},
+            response_type=None,
+            _return_http_data_only=False,
+            _preload_content=False,
+            auth_settings=['AuthorizationHeaderToken']
+        )
+        return self._read_json_response(response)
+
+    def list_pull_review_comments(self, owner: str, repo: str, pr_number: int, review_id: int):
+        response = self.api_client.call_api(
+            '/repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}/comments',
+            'GET',
+            path_params={'owner': owner, 'repo': repo, 'pr_number': pr_number, 'review_id': review_id},
+            response_type=None,
+            _return_http_data_only=False,
+            _preload_content=False,
+            auth_settings=['AuthorizationHeaderToken']
+        )
+        return self._read_json_response(response)
+
+    def _read_json_response(self, response):
+        if hasattr(response, 'data'):
+            raw_data = response.data.read()
+        elif isinstance(response, tuple) and response and hasattr(response[0], 'read'):
+            raw_data = response[0].read()
+        else:
+            return []
+        if not raw_data:
+            return []
+        return json.loads(decode_if_bytes(raw_data))
 
     def create_comment(self, owner: str, repo: str, index: int, comment: str):
         body = {
@@ -781,6 +1054,15 @@ class RepoApi(giteapy.RepositoryApi):
             repo=repo,
             id=comment_id,
             body=body
+        )
+
+    def get_comment(self, owner: str, repo: str, comment_id: int):
+        return self.api_client.call_api(
+            '/repos/{owner}/{repo}/issues/comments/{id}',
+            'GET',
+            path_params={'owner': owner, 'repo': repo, 'id': comment_id},
+            response_type='Comment',
+            auth_settings=['AuthorizationHeaderToken']
         )
 
     def remove_comment(self, owner: str, repo: str, comment_id: int):
@@ -991,11 +1273,16 @@ class RepoApi(giteapy.RepositoryApi):
             auth_settings=['AuthorizationHeaderToken']
         )
 
-    def remove_reaction_comment(self, owner: str, repo: str, comment_id: int):
+    def remove_reaction_comment(self, owner: str, repo: str, comment_id: int, reaction_id: int | None = None):
+        path = '/repos/{owner}/{repo}/issues/comments/{id}/reactions'
+        path_params = {'owner': owner, 'repo': repo, 'id': comment_id}
+        if reaction_id is not None:
+            path = '/repos/{owner}/{repo}/issues/comments/{id}/reactions/{reaction_id}'
+            path_params['reaction_id'] = reaction_id
         return self.api_client.call_api(
-            '/repos/{owner}/{repo}/issues/comments/{id}/reactions',
+            path,
             'DELETE',
-            path_params={'owner': owner, 'repo': repo, 'id': comment_id},
+            path_params=path_params,
             response_type='Repository',
             auth_settings=['AuthorizationHeaderToken']
         )
@@ -1010,6 +1297,34 @@ class RepoApi(giteapy.RepositoryApi):
             index=issue_number,
             body=body
         )
+
+    def get_repo_labels(self, owner: str, repo: str):
+        return self.issue.issue_list_labels(owner=owner, repo=repo)
+
+    def get_commit_files(self, owner: str, repo: str, commit_sha: str):
+        try:
+            url = f'/repos/{owner}/{repo}/git/commits/{commit_sha}'
+            response = self.api_client.call_api(
+                url,
+                'GET',
+                path_params={},
+                response_type=None,
+                _return_http_data_only=False,
+                _preload_content=False,
+                auth_settings=['AuthorizationHeaderToken']
+            )
+            if hasattr(response, 'data'):
+                raw_data = response.data.read()
+                commit_data = json.loads(raw_data.decode('utf-8'))
+            elif isinstance(response, tuple):
+                raw_data = response[0].read()
+                commit_data = json.loads(raw_data.decode('utf-8'))
+            else:
+                return []
+            return commit_data.get("files", [])
+        except Exception as e:
+            self.logger.error(f"Error getting commit files: {e}")
+            return []
 
     def get_pr_commits(self, owner: str, repo: str, pr_number: int):
         """Get all commits in a pull request"""

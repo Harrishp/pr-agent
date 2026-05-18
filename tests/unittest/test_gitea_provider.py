@@ -8,7 +8,6 @@ class TestGiteaProvider:
     @patch('pr_agent.git_providers.gitea_provider.get_settings')
     @patch('pr_agent.git_providers.gitea_provider.giteapy.ApiClient')
     def test_gitea_provider_auth_header(self, mock_api_client_cls, mock_get_settings):
-        # Setup settings
         settings = MagicMock()
         settings.get.side_effect = lambda k, d=None: {
             'GITEA.URL': 'https://gitea.example.com',
@@ -19,22 +18,18 @@ class TestGiteaProvider:
         }.get(k, d)
         mock_get_settings.return_value = settings
 
-        # Setup ApiClient mock
         mock_api_client = mock_api_client_cls.return_value
-        # Mock configuration object on client
         mock_api_client.configuration.api_key = {'Authorization': 'token test-token'}
 
-        # Mock responses for calls made during initialization
         def call_api_side_effect(path, method, **kwargs):
             mock_resp = MagicMock()
-            if 'files' in path: # get_change_file_pull_request
+            if 'files' in path:
                 mock_resp.data = BytesIO(b'[]')
                 return mock_resp
             if 'commits' in path:
                 mock_resp.data = BytesIO(b'[]')
                 return mock_resp
 
-            # Default fallback
             mock_resp.data = BytesIO(b'{}')
             return mock_resp
 
@@ -45,9 +40,6 @@ class TestGiteaProvider:
         client = mock_api_client
         repo_api = RepoApi(client)
 
-        # Now test methods independently
-
-        # 1. get_change_file_pull_request
         mock_api_client.reset_mock()
         mock_resp = MagicMock()
         mock_resp.data = BytesIO(b'[]')
@@ -60,7 +52,6 @@ class TestGiteaProvider:
         assert kwargs.get('auth_settings') == ['AuthorizationHeaderToken']
         assert 'token=' not in args[0]
 
-        # 2. get_pull_request_diff
         mock_api_client.reset_mock()
         mock_resp = MagicMock()
         mock_resp.data = BytesIO(b'diff content')
@@ -72,7 +63,6 @@ class TestGiteaProvider:
         assert args[0] == '/repos/owner/repo/pulls/123.diff'
         assert kwargs.get('auth_settings') == ['AuthorizationHeaderToken']
 
-        # 3. get_languages
         mock_api_client.reset_mock()
         mock_resp.data = BytesIO(b'{"Python": 100}')
         mock_api_client.call_api.return_value = mock_resp
@@ -83,7 +73,6 @@ class TestGiteaProvider:
         assert args[0] == '/repos/owner/repo/languages'
         assert kwargs.get('auth_settings') == ['AuthorizationHeaderToken']
 
-        # 4. get_file_content
         mock_api_client.reset_mock()
         mock_resp.data = BytesIO(b'content')
         mock_api_client.call_api.return_value = mock_resp
@@ -95,7 +84,6 @@ class TestGiteaProvider:
         assert kwargs.get('query_params') == [('ref', 'sha1')]
         assert kwargs.get('auth_settings') == ['AuthorizationHeaderToken']
 
-        # 5. get_pr_commits
         mock_api_client.reset_mock()
         mock_resp.data = BytesIO(b'[]')
         mock_api_client.call_api.return_value = mock_resp
@@ -142,3 +130,73 @@ class TestGiteaProvider:
         result = repo_api.get_change_file_pull_request("owner", "repo", 123)
 
         assert result == [{"filename": "中文.java"}]
+
+    def test_get_comment_body_from_comment_id(self):
+        from pr_agent.git_providers.gitea_provider import GiteaProvider
+
+        provider = object.__new__(GiteaProvider)
+        provider.owner = "owner"
+        provider.repo = "repo"
+        provider.max_comment_chars = 65000
+        provider.logger = MagicMock()
+        provider.repo_api = MagicMock()
+        provider.repo_api.get_comment.return_value = MagicMock(body="hello")
+
+        assert provider.get_comment_body_from_comment_id(10) == "hello"
+        provider.repo_api.get_comment.assert_called_once_with(owner="owner", repo="repo", comment_id=10)
+
+    def test_remove_reaction_accepts_reaction_id(self):
+        from pr_agent.git_providers.gitea_provider import GiteaProvider
+
+        provider = object.__new__(GiteaProvider)
+        provider.owner = "owner"
+        provider.repo = "repo"
+        provider.logger = MagicMock()
+        provider.repo_api = MagicMock()
+        provider.repo_api.remove_reaction_comment.return_value = True
+
+        assert provider.remove_reaction(11, 22) is True
+        provider.repo_api.remove_reaction_comment.assert_called_once_with(
+            owner="owner", repo="repo", comment_id=11, reaction_id=22
+        )
+
+    def test_get_canonical_url_parts_from_git_url(self):
+        from pr_agent.git_providers.gitea_provider import GiteaProvider
+
+        provider = object.__new__(GiteaProvider)
+        provider.owner = None
+        provider.repo = None
+        provider.base_url = "https://gitea.example.com"
+        provider.logger = MagicMock()
+
+        prefix, suffix = provider.get_canonical_url_parts("https://gitea.example.com/acme/widgets.git", "main")
+
+        assert prefix == "https://gitea.example.com/acme/widgets/src/branch/main"
+        assert suffix == ""
+
+    def test_publish_code_suggestions_returns_false_on_failure(self):
+        from pr_agent.git_providers.gitea_provider import GiteaProvider
+
+        provider = object.__new__(GiteaProvider)
+        provider.logger = MagicMock()
+        provider.publish_inline_comments = MagicMock(return_value=False)
+
+        result = provider.publish_code_suggestions([
+            {"body": "suggestion", "relevant_file": "a.py", "relevant_lines_start": 3}
+        ])
+
+        assert result is False
+
+    def test_repo_api_get_comment_uses_direct_api(self, repo_api):
+        repo_api.get_comment("owner", "repo", 7)
+
+        args, kwargs = repo_api.api_client.call_api.call_args
+        assert args[0] == '/repos/{owner}/{repo}/issues/comments/{id}'
+        assert kwargs["path_params"] == {'owner': 'owner', 'repo': 'repo', 'id': 7}
+
+    def test_repo_api_remove_reaction_with_reaction_id(self, repo_api):
+        repo_api.remove_reaction_comment("owner", "repo", 7, 9)
+
+        args, kwargs = repo_api.api_client.call_api.call_args
+        assert args[0] == '/repos/{owner}/{repo}/issues/comments/{id}/reactions/{reaction_id}'
+        assert kwargs["path_params"] == {'owner': 'owner', 'repo': 'repo', 'id': 7, 'reaction_id': 9}

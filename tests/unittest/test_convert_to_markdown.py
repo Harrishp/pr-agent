@@ -123,6 +123,52 @@ class TestConvertToMarkdown:
         assert convert_to_markdown_v2(input_data, git_provider=mock_git_provider).strip() == expected_output.strip()
         mock_git_provider.get_line_link.assert_called_with('src/utils.py', 30, 50)
 
+    def test_gitea_review_markdown_basic(self):
+        input_data = {'review': {
+            'estimated_effort_to_review_[1-5]': '1, because the changes are minimal.',
+            'relevant_tests': 'Yes',
+            'security_concerns': 'No'
+        }}
+
+        output = convert_to_markdown_v2(input_data, markdown_flavor="gitea")
+
+        assert "| 项目 | 详情 |" in output
+        assert "|------|------|" in output
+        assert "| ⏱️ **Review 难度** | 1 / 5" in output
+        assert "🔵⚫⚫⚫⚫" in output
+        assert "| 🧪 **包含测试** | ✅ 是 |" in output
+        assert "| 🔒 **安全问题** | ✅ 未发现明显安全问题 |" in output
+        assert "<table>" not in output
+        assert "<tr>" not in output
+        assert "<details>" not in output
+
+    def test_gitea_key_issues_to_review(self):
+        input_data = {'review': {
+            'key_issues_to_review': [
+                {
+                    'relevant_file': 'src/utils.py',
+                    'issue_header': 'Buffer Risk',
+                    'issue_content': 'The buffer can overflow when many rows are appended.',
+                    'start_line': 30,
+                    'end_line': 50,
+                }
+            ]
+        }}
+        mock_git_provider = Mock()
+        reference_link = 'http://gitea.local/owner/repo/src/branch/test/src/utils.py#L30-L50'
+        mock_git_provider.get_line_link.return_value = reference_link
+
+        output = convert_to_markdown_v2(input_data, git_provider=mock_git_provider, markdown_flavor="gitea")
+
+        assert "| 项目 | 详情 |" in output
+        assert "| ⚡ **重点关注区域** |" in output
+        assert f"[**Buffer Risk**]({reference_link})" in output
+        assert "`src/utils.py#L30`" in output
+        assert "The buffer can overflow when many rows are appended." in output
+        assert "<a href>" not in output
+        assert "<details>" not in output
+        mock_git_provider.get_line_link.assert_called_with('src/utils.py', 30, 50)
+
     def test_ticket_compliance(self):
         input_data = {'review': {
             'ticket_compliance_check': [
