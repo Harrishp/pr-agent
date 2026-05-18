@@ -335,10 +335,16 @@ class GiteaProvider(GitProvider):
                 repo=self.repo,
                 comment_id=comment_id
             )
-            return self._get_attr(comment, "body", "")
+            body = self._get_attr(comment, "body", "")
+            if body:
+                return body
         except Exception as e:
             self.logger.error(f"Failed to get comment body, error: {e}")
-            return None
+
+        review_comment = self.get_pull_review_comment(comment_id)
+        if review_comment:
+            return review_comment.get("body", "")
+        return None
 
     def reply_to_comment_from_comment_id(self, comment_id: int, body: str):
         body = self.limit_output_characters(body, self.max_comment_chars)
@@ -351,8 +357,53 @@ class GiteaProvider(GitProvider):
             self.logger.error(f"Failed to reply comment, error: {e}")
             return None
 
+    def get_pull_review_comment(self, comment_id: int) -> Optional[Dict[str, Any]]:
+        if not self.enabled_pr:
+            return None
+        try:
+            reviews = self.repo_api.list_pull_reviews(self.owner, self.repo, self.pr_number) or []
+            for review in reviews:
+                review_id = self._get_attr(review, "id")
+                if not review_id:
+                    continue
+                comments = self.repo_api.list_pull_review_comments(self.owner, self.repo, self.pr_number, review_id) or []
+                for comment in comments:
+                    if self._get_attr(comment, "id") != comment_id:
+                        continue
+                    line = (
+                        self._get_attr(comment, "line")
+                        or self._get_attr(comment, "new_line")
+                        or self._get_attr(comment, "original_position")
+                        or self._get_attr(comment, "position")
+                    )
+                    line_comment = {
+                        "id": self._get_attr(comment, "id"),
+                        "body": self._get_attr(comment, "body", ""),
+                        "path": self._get_attr(comment, "path", ""),
+                        "diff_hunk": self._get_attr(comment, "diff_hunk", ""),
+                        "line": line,
+                        "start_line": line,
+                        "side": self._get_attr(comment, "side", "RIGHT") or "RIGHT",
+                        "commit_id": self._get_attr(comment, "commit_id", ""),
+                        "original_position": self._get_attr(comment, "original_position"),
+                        "position": self._get_attr(comment, "position"),
+                        "pull_request_review_id": self._get_attr(comment, "pull_request_review_id", review_id),
+                    }
+                    self.logger.info(
+                        f"Found Gitea review line comment id={comment_id}, path={line_comment['path']}, line={line}"
+                    )
+                    return line_comment
+            self.logger.info(f"Gitea review line comment id={comment_id} not found")
+            return None
+        except Exception as e:
+            self.logger.error(f"Failed to get Gitea review line comment id={comment_id}, error: {e}")
+            return None
+
     def get_review_thread_comments(self, comment_id: int) -> list[dict]:
         try:
+            review_comment = self.get_pull_review_comment(comment_id)
+            if review_comment:
+                return [review_comment]
             comments = self.get_issue_comments()
             return [comment for comment in comments if self._get_attr(comment, "id") == comment_id]
         except Exception as e:
@@ -947,6 +998,41 @@ class RepoApi(giteapy.RepositoryApi):
             response_type='Repository',
             auth_settings=['AuthorizationHeaderToken']
         )
+
+    def list_pull_reviews(self, owner: str, repo: str, pr_number: int):
+        response = self.api_client.call_api(
+            '/repos/{owner}/{repo}/pulls/{pr_number}/reviews',
+            'GET',
+            path_params={'owner': owner, 'repo': repo, 'pr_number': pr_number},
+            response_type=None,
+            _return_http_data_only=False,
+            _preload_content=False,
+            auth_settings=['AuthorizationHeaderToken']
+        )
+        return self._read_json_response(response)
+
+    def list_pull_review_comments(self, owner: str, repo: str, pr_number: int, review_id: int):
+        response = self.api_client.call_api(
+            '/repos/{owner}/{repo}/pulls/{pr_number}/reviews/{review_id}/comments',
+            'GET',
+            path_params={'owner': owner, 'repo': repo, 'pr_number': pr_number, 'review_id': review_id},
+            response_type=None,
+            _return_http_data_only=False,
+            _preload_content=False,
+            auth_settings=['AuthorizationHeaderToken']
+        )
+        return self._read_json_response(response)
+
+    def _read_json_response(self, response):
+        if hasattr(response, 'data'):
+            raw_data = response.data.read()
+        elif isinstance(response, tuple) and response and hasattr(response[0], 'read'):
+            raw_data = response[0].read()
+        else:
+            return []
+        if not raw_data:
+            return []
+        return json.loads(decode_if_bytes(raw_data))
 
     def create_comment(self, owner: str, repo: str, index: int, comment: str):
         body = {

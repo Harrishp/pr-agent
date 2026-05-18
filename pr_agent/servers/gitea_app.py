@@ -177,16 +177,25 @@ async def handle_comments_on_pr(body: Dict[str, Any], event: str, sender: str, s
         return {}
 
     disable_eyes = False
+    comment_id = comment.get("id")
+    provider = get_git_provider_with_context(pr_url=pr_url)
     try:
-        if '/ask' in comment_body and _is_line_comment(comment):
-            comment_body = handle_line_comments(body, comment_body)
-            disable_eyes = True
+        normalized_comment_body = comment_body.lstrip() if isinstance(comment_body, str) else ""
+        if normalized_comment_body.startswith('/ask'):
+            if not _is_line_comment(comment) and comment_id:
+                line_comment = provider.get_pull_review_comment(comment_id)
+                if line_comment:
+                    comment.update(line_comment)
+                    body["comment"] = comment
+                else:
+                    get_logger().info(f"Gitea line comment id={comment_id} not found, falling back to regular /ask")
+            if _is_line_comment(comment):
+                comment_body = handle_line_comments(body, comment_body)
+                disable_eyes = True
     except Exception as e:
         get_logger().error("Failed to handle line comment", artifact={'error': e})
 
     log_context["api_url"] = pr_url
-    comment_id = comment.get("id")
-    provider = get_git_provider_with_context(pr_url=pr_url)
     with get_logger().contextualize(**log_context):
         if get_identity_provider().verify_eligibility("gitea", sender_id, pr_url) is not Eligibility.NOT_ELIGIBLE:
             get_logger().info(f"Processing comment on PR {pr_url=}, comment_body={comment_body}")
@@ -267,15 +276,34 @@ def handle_closed_pr(body, event, action, log_context):
 
 
 def _is_line_comment(comment: Dict[str, Any]) -> bool:
-    return any(key in comment for key in ("path", "line", "new_position", "old_position", "diff_hunk"))
+    has_location = any(key in comment for key in ("path", "file_path", "filename", "diff_hunk"))
+    has_line = any(key in comment for key in (
+        "line", "new_line", "new_position", "old_position", "original_position", "position", "pull_request_review_id"
+    ))
+    return has_location and has_line
 
 
 def handle_line_comments(body: Dict, comment_body: str) -> str:
     if not comment_body:
         return ""
     comment = body.get("comment", {})
-    start_line = comment.get("start_line") or comment.get("line") or comment.get("new_line") or comment.get("new_position")
-    end_line = comment.get("line") or comment.get("new_line") or comment.get("new_position") or start_line
+    start_line = (
+        comment.get("start_line")
+        or comment.get("line")
+        or comment.get("new_line")
+        or comment.get("new_position")
+        or comment.get("original_position")
+        or comment.get("position")
+    )
+    end_line = (
+        comment.get("end_line")
+        or comment.get("line")
+        or comment.get("new_line")
+        or comment.get("new_position")
+        or comment.get("original_position")
+        or comment.get("position")
+        or start_line
+    )
     side = comment.get("side") or "RIGHT"
     path = comment.get("path") or comment.get("file_path") or comment.get("filename", "")
     comment_id = comment.get("id")
